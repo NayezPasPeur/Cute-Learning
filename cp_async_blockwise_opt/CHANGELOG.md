@@ -1,6 +1,9 @@
-# CHANGELOG — cp_async blockwise scatter group-GEMM optimization
+# CHANGELOG — cp_async blockwise group-GEMM optimization
 
-**Target**: `group_gemm_fp8_blockwise_scatter_kernel` (SM90, cp.async + SS-WGMMA)
+**Target**: Both blockwise cp.async kernels (SM90, SS-WGMMA):
+- `group_gemm_fp8_blockwise_multistage_kernel` (contiguous A)
+- `group_gemm_fp8_blockwise_scatter_kernel` (scatter/gather A)
+
 **Goal**: Improve occupancy and bandwidth utilization for Hunyuan-V3 TP=4 shapes
 **Date**: 2026-05-12
 
@@ -235,14 +238,110 @@ cycles ≈ 0.4 μs. Marginal individually but free.
 | 1024      | 48     | OPT-3,4 (BF16 accum)    | 3–5%            |
 | 2048–4096 | 64     | OPT-3,4                 | 2–4%            |
 
+---
+
+## Part 2: Contiguous-A kernel (`group_gemm_blockwise_fp8.cu`)
+
+### OPT-A: Eliminate tCS[kN] register array — fold into dequant FMA loop
+
+**The single largest register-pressure optimization in this PR.**
+
+**Problem**: The original code pre-computes `float tCS[kN]` (xscale × wscale
+per N-column) BEFORE issuing WGMMA, then uses it AFTER WGMMA completes.
+This keeps kN FP32 registers live across the entire WGMMA instruction
+sequence. Register pressure per kTileM:
+
+| kTileM | kN (approx) | Extra regs from tCS |
+|--------|-------------|---------------------|
+| 8      | 4           | 4                   |
+| 16     | 8           | 8                   |
+| 32     | 8           | 8                   |
+| 48     | 12          | 12                  |
+| 64     | 16          | 16                  |
+
+For kTileM=48/64, these 12–16 extra registers are the difference between
+kMinBlocks=2 (spilling) and kMinBlocks=3 (no spilling).
+
+**Solution**: Delete the tCS array entirely. Read xscale inline during
+the post-WGMMA dequant FMA loop:
+
+- **kTileM ≤ 32**: one smem read per thread + `__shfl_sync` broadcast
+  per N-column. Cost: ~5 cycles/column, fully hidden by FMA throughput.
+- **kTileM > 32**: direct `sAS(m_idx, ...)` smem read per N-column.
+  Cost: ~20 cycles/column, interleaved with FMA by the compiler.
+
+**Expected impact**: 5–10% at BS=1024–4096 (kTileM=48/64) by enabling
+higher kMinBlocks; 2–3% at smaller BS from reduced register pressure.
+
+---
+
+### OPT-B: Replace G2SCopyAS with inline cp.async
+
+Same optimization as the scatter kernel's P0 reg-reduction, ported to
+the contiguous kernel. The CuTe `G2SCopyAS` path's partition state
+(tgAS, tsAS, pred_xs) consumed ~4–6 registers that survived the main
+loop. Replaced with:
+
+```cpp
+const bool xs_live = (idx < Config::kXsLiveThrs);
+const int  xs_thr_off = idx * 4;
+auto xs_cp_async = [&](int itile, int ismem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ...);
+};
+```
+
+**Savings**: 2–3 net registers (reduced from 5–6 to 3 scalar values).
+
+---
+
+### OPT-C: Pre-read wscale before fence_view_async_shared
+
+Moved `sBS(itile)` read to BEFORE `fence_view_async_shared()`:
+
+```cpp
+cp_async_wait<kStage - 1>();
+__syncthreads();
+const float wscale_val = sBS(itile);    // ← moved here (generic proxy, safe)
+cutlass::arch::fence_view_async_shared();
+// ... WGMMA ...
+```
+
+sBS was fully loaded synchronously before the main loop. This generic-proxy
+`ld.shared` is safe after `__syncthreads()` and doesn't need the async
+fence. Moving it earlier hides the ~20-cycle smem latency behind the
+fence instruction's execution.
+
+---
+
+### OPT-D: Picker table — add n=768 entries for Hunyuan-V3 TP=4
+
+**Problem**: The original k=4096 picker table only covers n ∈ {384, 512,
+1024}. For Hunyuan-V3 TP=4, GEMM1 uses **n=768** which falls through to
+the per-tile_m default (kStage=2, kMinBlocks=2, gridMul=9 for kTileM=8).
+This default was tuned for n=384 and is suboptimal for n=768.
+
+**Solution**: Added n=768 entries for all kTileM buckets:
+
+| kTileM | n=768 picker                  | Rationale |
+|--------|-------------------------------|-----------|
+| 8      | Ks=3, Kmb=3, Gm=14..18       | Balance pipeline depth & occupancy |
+| 16     | Ks=2, Kmb=3, Gm=16           | Higher occupancy target |
+| 32     | Ks=2, Kmb=3, Gm=10           | Moderate grid |
+| 48     | Ks=2, Kmb=3, Gm=12           | Match n=384 pattern |
+| 64     | Ks=2, Kmb=3, Gm=12           | Slightly more grid |
+
+---
+
 ## Files
 
 ```
 cp_async_blockwise_opt/
 ├── original/
-│   └── group_gemm_blockwise_scatter_fp8.cu   ← unmodified baseline
+│   ├── group_gemm_blockwise_fp8.cu           ← contiguous A baseline
+│   └── group_gemm_blockwise_scatter_fp8.cu   ← scatter A baseline
 ├── optimized/
-│   └── group_gemm_blockwise_scatter_fp8.cu   ← all OPT-1..6 applied
+│   ├── group_gemm_blockwise_fp8.cu           ← OPT-A,B,C,D applied
+│   └── group_gemm_blockwise_scatter_fp8.cu   ← OPT-1..6 applied
 └── CHANGELOG.md                              ← this file
 ```
 
@@ -253,5 +352,6 @@ cp_async_blockwise_opt/
 - [ ] Compare bws_cpa column vs OLD reference
 - [ ] Verify numerical accuracy (max abs diff vs FP32 reference < 1e-2)
 - [ ] Profile with `ncu` to confirm occupancy increase for BS=32–128
-- [ ] Check register spill count (`ncu --metrics l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum`)
-- [ ] If BF16 accum (OPT-3) causes precision issues, disable via `kUseBF16Accum = false`
+- [ ] Check register spill count with `ncu --metrics launch__registers_per_thread`
+- [ ] Verify OPT-A register savings: compare PTX register count before/after
+- [ ] If BF16 accum (OPT-3, scatter only) causes precision issues, disable via `kUseBF16Accum = false`
